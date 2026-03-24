@@ -1,52 +1,149 @@
--- Compulsory
-CREATE OR REPLACE PROCEDURE num_of_rows IS
-    -- Associative array to hold the row counts in memory
-    TYPE t_block_counts IS TABLE OF NUMBER INDEX BY VARCHAR2(50);
-    v_counts t_block_counts;
-    v_idx    VARCHAR2(50);
-    v_rows   NUMBER;
+-- 1.
+-- How many data blocks are allocated in the database for the table NIKOVITS.CIKK?
+-- There can be empty blocks, but we count them too.
+-- The same question: how many data blocks does the segment of the table have?
+SELECT OWNER, SEGMENT_NAME, BLOCKS
+FROM DBA_SEGMENTS
+WHERE OWNER='NIKOVITS' AND SEGMENT_TYPE='TABLE' AND SEGMENT_NAME='CIKK';
+
+SELECT OWNER, SEGMENT_NAME, SUM(BLOCKS)
+FROM DBA_EXTENTS
+WHERE OWNER='NIKOVITS'
+AND   SEGMENT_NAME='CIKK'
+GROUP BY OWNER, SEGMENT_NAME;
+
+-- 2.
+-- How many filled data blocks does the previous table have?
+-- Filled means that the block is not empty (there is at least one row in it).
+-- This question is not the same as the previous !!!
+-- How many empty data blocks does the table have?
+-- Blocks, bytes in dba_segments are allocated space for a specific table.
+-- 8 blocks may be allocated, but only 5 are filled with actual data, 3 remating blocks are strictly reserved only for this table like parking spot for people with disabilities.
+-- Allocated, actually used, empty space, oracle uses blocks, not bytes.
+
+SELECT OWNER, SEGMENT_NAME, BLOCKS
+FROM DBA_SEGMENTS
+WHERE OWNER='NIKOVITS' AND SEGMENT_TYPE='TABLE' AND SEGMENT_NAME='CIKK';
+
+SELECT OWNER, TABLE_NAME, BLOCKS, EMPTY_BLOCKS, NUM_ROWS
+FROM DBA_tables
+WHERE OWNER='NIKOVITS'
+AND   TABLE_NAME='CIKK';
+
+-- 3.
+-- How many rows are there in each block of the previous table?
+SELECT DBMS_ROWID.ROWID_BLOCK_NUMBER(ROWID),
+       COUNT(*)
+FROM NIKOVITS.CIKK
+GROUP BY DBMS_ROWID.ROWID_BLOCK_NUMBER(ROWID);
+
+-- 4.
+-- There is a table NIKOVITS.ELADASOK which has the following row:
+-- szla_szam = 100 (szla_szam is a column name)
+-- In which datafile is the given row stored?
+-- Within the datafile in which data block? (block number) 
+-- In which data object? (Give the name of the segment.)
+
+SELECT *
+FROM DBA_TAB_COLUMNS
+WHERE OWNER='NIKOVITS' AND TABLE_NAME='ELADASOK';
+
+SELECT *
+FROM DBA_EXTENTS
+WHERE SEGMENT_NAME='ELADASOK' AND OWNER='NIKOVITS';
+
+SELECT *
+FROM DBA_DATA_FILES
+WHERE FILE_ID IN (7, 5);
+-- ELADASOK table is in Users and Example tablspaces
+
+-- 2. In which datafile is the given row stored (szla_szam)?
+SELECT dbms_rowid.rowid_relative_fno(ROWID) file_id, 
+       dbms_rowid.rowid_object(ROWID) data_object,
+       dbms_rowid.rowid_block_number(ROWID) block_nr, 
+       dbms_rowid.rowid_row_number(ROWID) row_nr 
+FROM nikovits.eladasok 
+WHERE szla_szam = 100;
+
+SELECT dbms_rowid.rowid_relative_fno(ROWID) file_id, 
+       dbms_rowid.rowid_object(ROWID) data_object,
+       dbms_rowid.rowid_block_number(ROWID) block_nr, 
+       dbms_rowid.rowid_row_number(ROWID) row_nr 
+FROM EMP
+WHERE ENAME='SMITH';
+
+SELECT *
+FROM DBA_DATA_FILES
+WHERE FILE_ID=7;
+-- /u01/app/oracle/oradata/ullman/users01.dbf
+-- 1484087
+-- 1066283
+
+
+-- -------------------------------------------------------
+-- **************************************************************************
+-- Compulsory exercise. Deadline: next practice
+-- Don't send your solution to me, but check it with 'check_plsql' procedure (see below).
+-- **************************************************************************
+-- 5.
+-- Write a PL/SQL procedure which prints out the number of rows in each data block for the 
+-- following table: NIKOVITS.TABLA_123. (Output format:  file_id; block_id -> num_of_rows;
+-- Output is sorted by file_id then by block_id.
+-- CREATE OR REPLACE PROCEDURE num_of_rows IS 
+-- ...
+-- Test:
+-- -----
+SET SERVEROUTPUT ON
+execute num_of_rows();
+
+-- Check your solution with the following procedure:
+execute check_plsql('num_of_rows()');
+
+-- Hint:
+-- List the extents of the table. You can find the first data block of the extent and the size of the extent (in blocks)
+-- in DBA_EXTENTS. Check the individual data blocks, how many rows they contain. (--> ROWID helps you)
+
+SELECT file_id, block_id, blocks
+FROM dba_extents 
+WHERE owner = 'NIKOVITS'
+    AND segment_name = 'TABLA_123';
+
+
+CREATE OR REPLACE PROCEDURE num_of_rows AUTHID CURRENT_USER IS
+    v_count NUMBER;
 BEGIN
-    -- STEP 1: Get the actual row count per block currently holding data
-    -- We use DBMS_ROWID to extract the Relative File Number and Block Number
-    FOR r IN (
-        SELECT DBMS_ROWID.ROWID_RELATIVE_FNO(rowid) AS rel_fno,
-               DBMS_ROWID.ROWID_BLOCK_NUMBER(rowid) AS block_id,
-               COUNT(*) AS cnt
-        FROM NIKOVITS.TABLA_123
-        GROUP BY DBMS_ROWID.ROWID_RELATIVE_FNO(rowid),
-                 DBMS_ROWID.ROWID_BLOCK_NUMBER(rowid)
-    ) LOOP
-        -- Create a unique key (e.g., "4_1205") and store the count
-        v_idx := r.rel_fno || '_' || r.block_id;
-        v_counts(v_idx) := r.cnt;
-    END LOOP;
-    
-    -- STEP 2: Loop through all allocated extents for the table
-    FOR ext IN (
-        SELECT file_id, relative_fno, block_id, blocks 
+    -- We loop through the metadata view to find EVERY block allocated to the table
+    FOR r_ext IN (
+        SELECT file_id, block_id, blocks 
         FROM dba_extents 
         WHERE owner = 'NIKOVITS' 
           AND segment_name = 'TABLA_123'
         ORDER BY file_id, block_id
     ) LOOP
-        -- STEP 3: Iterate through every single block inside the current extent
-        FOR i IN 0 .. ext.blocks - 1 LOOP
-            v_idx := ext.relative_fno || '_' || (ext.block_id + i);
+        -- For every extent, we must visit every block from start_id to (start_id + size)
+        FOR i IN 0 .. (r_ext.blocks - 1) LOOP
             
-            -- Check if our associative array has a count for this specific block
-            IF v_counts.EXISTS(v_idx) THEN
-                v_rows := v_counts(v_idx);
-            ELSE
-                v_rows := 0; -- The block is allocated but empty
-            END IF;
+            -- Count how many rows exist in this specific file/block combo
+            SELECT COUNT(*) INTO v_count 
+            FROM NIKOVITS.TABLA_123
+            WHERE DBMS_ROWID.ROWID_BLOCK_NUMBER(rowid) = r_ext.block_id + i
+              AND DBMS_ROWID.ROWID_RELATIVE_FNO(rowid) = r_ext.file_id;
             
-            -- Print the output in the strictly required format
-            DBMS_OUTPUT.PUT_LINE(ext.file_id || '; ' || (ext.block_id + i) || ' -> ' || v_rows || ';');
+            -- Formatting must match exactly: file_id; block_id -> count;
+            DBMS_OUTPUT.PUT_LINE(r_ext.file_id || '; ' || (r_ext.block_id + i) || ' -> ' || v_count || ';');
+            
         END LOOP;
     END LOOP;
 END;
 /
 
-execute check_plsql('num_of_rows()');
+SET SERVEROUTPUT ON;
+execute num_of_rows;
 
-commit;
+SELECT COUNT(*)
+FROM NIKOVITS.TABLA_123;
+
+SELECT * FROM DBA_EXTENTS
+WHERE OWNER='NIKOVITS' AND SEGMENT_NAME='TABLA_123';
+
+DROP PROCEDURE num_of_rows;
